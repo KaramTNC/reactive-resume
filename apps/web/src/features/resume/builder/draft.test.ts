@@ -5,6 +5,7 @@ import type { Resume } from "./draft";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { i18n } from "@lingui/core";
+import { ORPCError } from "@orpc/client";
 import { defaultResumeData } from "@reactive-resume/schema/resume/default";
 import { useBuilderResumeUpdateSubscription, useResumeStore, useResumeUpdateSubscription } from "./draft";
 
@@ -30,9 +31,14 @@ const toastMocks = vi.hoisted(() => ({
 	error: vi.fn(() => "sync-error-toast"),
 }));
 
-vi.mock("@orpc/client", () => ({
-	consumeEventIterator: consumeEventIteratorMock,
-}));
+vi.mock("@orpc/client", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@orpc/client")>();
+
+	return {
+		...actual,
+		consumeEventIterator: consumeEventIteratorMock,
+	};
+});
 
 vi.mock("@tanstack/react-query", () => ({
 	useQueryClient: () => queryClientMock,
@@ -103,10 +109,25 @@ function withBasicsName(resume: Resume, name: string): Resume {
 	};
 }
 
+function withSummaryContent(resume: Resume, content: string): Resume {
+	return {
+		...resume,
+		data: {
+			...resume.data,
+			summary: {
+				...resume.data.summary,
+				content,
+			},
+		},
+	};
+}
+
+function withUpdatedAt(resume: Resume, updatedAt: string): Resume {
+	return { ...resume, updatedAt: new Date(updatedAt) };
+}
+
 async function flushMicrotasks() {
-	await Promise.resolve();
-	await Promise.resolve();
-	await Promise.resolve();
+	for (let index = 0; index < 10; index += 1) await Promise.resolve();
 }
 
 describe("builder resume autosave", () => {
@@ -131,10 +152,11 @@ describe("builder resume autosave", () => {
 		useResumeStore.getState().reset();
 	});
 
-	it("coalesces rapid local edits into one full-data update", async () => {
+	it("coalesces rapid local edits into one data patch", async () => {
 		const initial = makeResume("resume-rapid");
-		const updated = withBasicsName(initial, "Latest Name");
+		const updated = withUpdatedAt(withBasicsName(initial, "Latest Name"), "2026-05-26T12:01:00.000Z");
 		orpcMocks.updateResume.mockResolvedValue(updated);
+		orpcMocks.patchResume.mockResolvedValue(updated);
 		useResumeStore.getState().initialize(initial);
 
 		useResumeStore.getState().updateResumeData((draft) => {
@@ -147,21 +169,25 @@ describe("builder resume autosave", () => {
 		vi.advanceTimersByTime(500);
 		await flushMicrotasks();
 
-		expect(orpcMocks.updateResume).toHaveBeenCalledTimes(1);
-		expect(orpcMocks.updateResume).toHaveBeenCalledWith(
-			{ id: initial.id, data: updated.data },
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(1);
+		expect(orpcMocks.patchResume).toHaveBeenCalledWith(
+			{
+				id: initial.id,
+				expectedUpdatedAt: initial.updatedAt,
+				operations: [{ op: "replace", path: "/basics/name", value: "Latest Name" }],
+			},
 			expect.objectContaining({ signal: expect.any(AbortSignal) }),
 		);
-		expect(orpcMocks.patchResume).not.toHaveBeenCalled();
+		expect(orpcMocks.updateResume).not.toHaveBeenCalled();
 	});
 
 	it("saves the latest pending snapshot after an in-flight save resolves", async () => {
 		const initial = makeResume("resume-in-flight");
-		const first = withBasicsName(initial, "First Name");
-		const latest = withBasicsName(initial, "Latest Name");
+		const first = withUpdatedAt(withBasicsName(initial, "First Name"), "2026-05-26T12:01:00.000Z");
+		const latest = withUpdatedAt(withBasicsName(initial, "Latest Name"), "2026-05-26T12:02:00.000Z");
 		let resolveFirst!: (resume: Resume) => void;
 
-		orpcMocks.updateResume
+		orpcMocks.patchResume
 			.mockReturnValueOnce(
 				new Promise<Resume>((resolve) => {
 					resolveFirst = resolve;
@@ -183,24 +209,32 @@ describe("builder resume autosave", () => {
 		vi.advanceTimersByTime(500);
 		await flushMicrotasks();
 
-		expect(orpcMocks.updateResume).toHaveBeenCalledTimes(1);
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(1);
 
 		resolveFirst(first);
 		await flushMicrotasks();
 
-		expect(orpcMocks.updateResume).toHaveBeenCalledTimes(2);
-		expect(orpcMocks.updateResume.mock.calls[0]?.[0]).toEqual({ id: initial.id, data: first.data });
-		expect(orpcMocks.updateResume.mock.calls[1]?.[0]).toEqual({ id: initial.id, data: latest.data });
-		expect(orpcMocks.patchResume).not.toHaveBeenCalled();
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(2);
+		expect(orpcMocks.patchResume.mock.calls[0]?.[0]).toEqual({
+			id: initial.id,
+			expectedUpdatedAt: initial.updatedAt,
+			operations: [{ op: "replace", path: "/basics/name", value: "First Name" }],
+		});
+		expect(orpcMocks.patchResume.mock.calls[1]?.[0]).toEqual({
+			id: initial.id,
+			expectedUpdatedAt: first.updatedAt,
+			operations: [{ op: "replace", path: "/basics/name", value: "Latest Name" }],
+		});
+		expect(orpcMocks.updateResume).not.toHaveBeenCalled();
 	});
 
 	it("does not run a stale debounced save after immediately saving an edit made during an in-flight save", async () => {
 		const initial = makeResume("resume-stale-timer");
-		const first = withBasicsName(initial, "First Name");
-		const latest = withBasicsName(initial, "Latest Name");
+		const first = withUpdatedAt(withBasicsName(initial, "First Name"), "2026-05-26T12:01:00.000Z");
+		const latest = withUpdatedAt(withBasicsName(initial, "Latest Name"), "2026-05-26T12:02:00.000Z");
 		let resolveFirst!: (resume: Resume) => void;
 
-		orpcMocks.updateResume
+		orpcMocks.patchResume
 			.mockReturnValueOnce(
 				new Promise<Resume>((resolve) => {
 					resolveFirst = resolve;
@@ -221,18 +255,22 @@ describe("builder resume autosave", () => {
 
 		resolveFirst(first);
 		await flushMicrotasks();
-		expect(orpcMocks.updateResume).toHaveBeenCalledTimes(2);
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(2);
 
 		vi.advanceTimersByTime(500);
 		await flushMicrotasks();
 
-		expect(orpcMocks.updateResume).toHaveBeenCalledTimes(2);
-		expect(orpcMocks.updateResume.mock.calls[1]?.[0]).toEqual({ id: initial.id, data: latest.data });
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(2);
+		expect(orpcMocks.patchResume.mock.calls[1]?.[0]).toEqual({
+			id: initial.id,
+			expectedUpdatedAt: first.updatedAt,
+			operations: [{ op: "replace", path: "/basics/name", value: "Latest Name" }],
+		});
 	});
 
 	it("keeps the latest draft data and shows a persistent toast when saving fails", async () => {
 		const initial = makeResume("resume-failure");
-		orpcMocks.updateResume.mockRejectedValue(new Error("network down"));
+		orpcMocks.patchResume.mockRejectedValue(new Error("network down"));
 		useResumeStore.getState().initialize(initial);
 
 		useResumeStore.getState().updateResumeData((draft) => {
@@ -247,7 +285,42 @@ describe("builder resume autosave", () => {
 			"Your latest changes could not be saved.",
 			expect.objectContaining({ duration: Number.POSITIVE_INFINITY }),
 		);
-		expect(orpcMocks.patchResume).not.toHaveBeenCalled();
+		expect(orpcMocks.updateResume).not.toHaveBeenCalled();
+	});
+
+	it("rebases pending local edits after a server version conflict", async () => {
+		const initial = makeResume("resume-conflict");
+		const remote = withUpdatedAt(withSummaryContent(initial, "Remote Summary"), "2026-05-26T12:01:00.000Z");
+		const merged = withUpdatedAt(withBasicsName(remote, "Local Name"), "2026-05-26T12:02:00.000Z");
+
+		orpcMocks.patchResume.mockRejectedValueOnce(new ORPCError("RESUME_VERSION_CONFLICT")).mockResolvedValueOnce(merged);
+		orpcMocks.getResumeById.mockResolvedValue(remote);
+		useResumeStore.getState().initialize(initial);
+
+		useResumeStore.getState().updateResumeData((draft) => {
+			draft.basics.name = "Local Name";
+		});
+
+		vi.advanceTimersByTime(500);
+		await flushMicrotasks();
+
+		expect(orpcMocks.getResumeById).toHaveBeenCalledWith(
+			{ id: initial.id },
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
+		expect(orpcMocks.patchResume).toHaveBeenCalledTimes(2);
+		expect(orpcMocks.patchResume.mock.calls[0]?.[0]).toEqual({
+			id: initial.id,
+			expectedUpdatedAt: initial.updatedAt,
+			operations: [{ op: "replace", path: "/basics/name", value: "Local Name" }],
+		});
+		expect(orpcMocks.patchResume.mock.calls[1]?.[0]).toEqual({
+			id: initial.id,
+			expectedUpdatedAt: remote.updatedAt,
+			operations: [{ op: "replace", path: "/basics/name", value: "Local Name" }],
+		});
+		expect(useResumeStore.getState().resume?.data.basics.name).toBe("Local Name");
+		expect(useResumeStore.getState().resume?.data.summary.content).toBe("Remote Summary");
 	});
 });
 
@@ -317,10 +390,12 @@ describe("resume update stream subscription", () => {
 
 	it("does not overwrite pending local builder edits when a remote update arrives", async () => {
 		const initial = makeResume("resume-pending");
-		const remote = withBasicsName(initial, "Remote Name");
+		const remote = withUpdatedAt(withSummaryContent(initial, "Remote Summary"), "2026-05-26T12:01:00.000Z");
+		const merged = withUpdatedAt(withBasicsName(remote, "Local Name"), "2026-05-26T12:02:00.000Z");
 		const cancel = vi.fn().mockResolvedValue(undefined);
 		consumeEventIteratorMock.mockReturnValue(cancel);
 		orpcMocks.getResumeById.mockResolvedValue(remote);
+		orpcMocks.patchResume.mockResolvedValue(merged);
 		routerParamsMock.value = { resumeId: initial.id };
 		useResumeStore.getState().initialize(initial);
 		useResumeStore.getState().updateResumeData((draft) => {
@@ -336,5 +411,15 @@ describe("resume update stream subscription", () => {
 
 		expect(queryClientMock.setQueryData).toHaveBeenCalledWith(["resume", "getById", initial.id], remote);
 		expect(useResumeStore.getState().resume?.data.basics.name).toBe("Local Name");
+		expect(useResumeStore.getState().resume?.data.summary.content).toBe("Remote Summary");
+		expect(orpcMocks.patchResume).toHaveBeenCalledWith(
+			{
+				id: initial.id,
+				expectedUpdatedAt: remote.updatedAt,
+				operations: [{ op: "replace", path: "/basics/name", value: "Local Name" }],
+			},
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
+		expect(orpcMocks.updateResume).not.toHaveBeenCalled();
 	});
 });
